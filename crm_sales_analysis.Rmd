@@ -1,0 +1,794 @@
+---
+title: "CRM Sales Pipeline Analysis: What Does Our Deal Data Actually Tell Us?"
+author: "Jonathan Elkins"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  fig.align  = 'center'
+)
+
+set.seed(42)
+
+```
+
+
+```{r libraries}
+
+library(tidyverse)
+library(scales)
+library(lubridate)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+
+```
+
+# Setting the Scene
+
+For this analysis I am stepping into the role of a data analyst who has just been handed access to the company CRM. CRM stands for Customer Relationship Management - it is the system sales teams use to track every deal they are working, from the first conversation with a prospect all the way through to a closed contract or a lost opportunity.
+
+The company sells computer hardware across three product lines - GTX, MG, and GTK - at price points ranging from $55 to nearly $27,000 per unit. The sales team is organized into regional offices, each managed by a sales manager who oversees a group of individual agents. Every deal an agent works gets logged in the pipeline with a stage, a product, an account, and eventually an outcome.
+
+This matters because CRM data is one of the richest sources of business intelligence a company has and one of the most underused. Most sales leaders look at a dashboard that shows total revenue and win rate. What they rarely see is where in the funnel deals are dying, which agents are punching above their weight, which products close fastest, and which customer segments are worth pursuing versus which ones are a waste of time.
+
+This is what we are going to find out. The dataset covers 8,800 deals worked between October 2016 and December 2017 across 35 sales agents, 7 products, and 85 customer accounts spanning multiple industries and geographies. By the end I want a clear picture of where this sales organization is performing well and where it is leaving money on the table.
+
+My job is not to judge the sales team. It is to find the signal in the data and ask the right questions.
+
+# Loading & Cleaning the Data
+
+before I touch a single chart I need to get the data into shape. This section is where real analyst work happens. Clean data does not exist in the wild - it gets made. I am going to load all five files, inspect each one, fix what is broken, and join everything into a single analysis-ready table.
+
+```{r load-data}
+accounts <- read_csv("data/crm_data/accounts.csv")
+data_dict <- read_csv("data/crm_data/data_dictionary.csv")
+products <- read_csv("data/crm_data/products.csv")
+sales_pipeline <- read_csv("data/crm_data/sales_pipeline.csv")
+sales_teams <- read_csv("data/crm_data/sales_teams.csv")
+
+glimpse(accounts)
+glimpse(products)
+glimpse(sales_pipeline)
+glimpse(sales_teams)
+
+```
+Four tables loaded. A few things stand out immediately before I touch anything. The accounts table has a typo in the sector company ("technolgy") instead of "technology". The sales pipeline has NA values in the close_value and a mix of zeros and real numbers. The data range runs from October 2016 through December 2017 giving us about 15 months of deal activity to work with. None of these are dealbreakers but all of them need to be addressed before the analysis starts.
+
+```{r clean-data}
+accounts <- accounts %>% 
+  mutate(sector = str_replace(sector, "technolgy", "technology"))
+
+sales_pipeline <- sales_pipeline %>% 
+  mutate(
+    close_value = ifelse(close_value == 0, NA, close_value),
+    deal_stage = factor(deal_stage,
+                        levels = c("Prospecting", "Engaging",
+                                   "Won", "Lost")),
+    days_to_close = as.numeric(close_date - engage_date)
+  )
+
+accounts %>% count(sector)
+```
+Three things happened in that chunk. The sector typo is fixed. Close values of zero are converted to NA (a zero dollar closed deal is almost certaintly a data entry error, not a reaction transaction). Deal stage is converted to a factor with a logical order so charts will always display Prospecting, Engaging, Won, Lost from left to right rather than alphabetically. And a new column calculates the number of days between the first engagement and the close data, which is what we will use later for deal velocity analysis.
+
+Now I need to join all four tables into one. The sales pipeline is the spine, every other table adds context to it. Sales team tells me which manager and region each agent belongs to. Accounts tells me the size, sector, and location of each customer. Products tells me the series and list price of each product in the deal.
+
+```{r join-data}
+crm <- sales_pipeline %>% 
+  left_join(sales_teams, by = "sales_agent") %>% 
+  left_join(accounts, by = "account") %>% 
+  left_join(products, by = "product")
+
+glimpse(crm)
+```
+Three left joins, one clean table. Left join is the right choice here because the sales pipeline is the record of truth. I want to keep every deal row regardless of whether is matches perfectly in the lookup tables. If a deal has an account or product that does not exist in the reference tables it will show up as NA rather than being silently dropped, which means I can catch data quality issues instead of losing rows without knowing it.
+
+The final table has one row per deal with everything attached. That is the table we will use for every chart and calculation from here forward.
+```{r data-quality}
+cat("Total deals:", nrow(crm), "\n")
+cat("Deals with no close value:", sum(is.na(crm$close_value)), "\n")
+cat("Deals with no close date:", sum(is.na(crm$close_data)), "\n")
+cat("Deals with negative days to close:",
+    sum(crm$days_to_close < 0, na.rm = T), "\n")
+```
+The most important number here is 4,562 deals with no close value recorded.
+That is 52% of the dataset. Those are the open pipeline deals plus any losses
+where the agent did not record a value. This means our revenue analysis is
+limited to won deals only and we cannot calculate the value of what we lost.
+That is a real data quality gap worth flagging to sales operations.
+
+```{r theme-setup}
+theme_crm <- function() {
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 14,
+                                      margin = margin(b = 8)),
+      plot.subtitle    = element_text(color = "grey40", size = 11,
+                                      margin = margin(b = 12)),
+      plot.caption     = element_text(color = "grey55", size = 9,
+                                      margin = margin(t = 10)),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey92"),
+      axis.text        = element_text(color = "grey40"),
+      legend.position  = "bottom",
+      strip.text       = element_text(face = "bold", size = 11)
+    )
+}
+
+palette_stage <- c(
+  "Prospecting" = "#95A5A6",
+  "Engaging"    = "#3498DB",
+  "Won"         = "#27AE60",
+  "Lost"        = "#E74C3C"
+)
+
+palette_series <- c(
+  "GTX" = "#2E86AB",
+  "MG"  = "#A23B72",
+  "GTK" = "#F18F01"
+)
+```
+
+# Pipeline Overview
+
+Before I drill into win rates or individual performance I want to understand the shape of the pipeline as a whole. How many deals are at each stage? What is the total value of the pipeline? How is deal activity distributed over time? These are the orienting questions every analyst should answer before doing anything more sophisticated.
+
+```{r pipeline-summary}
+pipeline_summary <- crm %>% 
+  group_by(deal_stage) %>% 
+  summarize(
+    deals = n(),
+    total_value = sum(close_value, na.rm = T),
+    avg_value   = mean(close_value, na.rm = T),
+    .groups = 'drop'
+  )
+
+pipeline_summary
+
+pipeline_summary %>% 
+  mutate(
+    deals = comma(deals),
+    total_value = dollar(total_value),
+    avg_value = dollar(avg_value, accuracy = 1)
+  ) %>% 
+  kable(
+    col.names = c("Stage", "Deals", "Total Value", "Avg Deal Value"),
+    align     = c("l", "r", "r", "r") 
+  ) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+The table orients me immediately. Won deals represent the largest group at 4,238 closed and are the only stage with recorded close values - $10 million in total revenue at an average of $2,361 per deal. Prospecting and Engaging show zero value because close value is only recorded at the time a deal is marked won or lost. The NA average value for Lost deals is worth noting - it means close value was not consistently recorded for losses, which is common in CRM systems where agents only fill in the value field when they win. That gap limits some of what we can analyze on the loss side.
+
+```{r}
+pipeline_summary %>% 
+  ggplot(aes(x = deal_stage, y = deals, fill = deal_stage)) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = comma(deals)),
+            vjust = -0.5, fontface = "bold", size = 4) +
+  scale_fill_manual(values = palette_stage, guide = "none") +
+  scale_y_continuous(limits = c(0, max(pipeline_summary$deals) * 1.15)) +
+  labs(
+    title = "Deal Count by Pipeline Stage",
+    subtitle = "Won and Lost represent closed deals | Prospecting and Engaging are open pipeline",
+    y = "Number of Deals",
+    caption = "Oct 2016 - Dec 2017"
+  ) +
+  theme_crm()
+```
+The shape of this funnel is worth pausing on. A healthy pipeline typically shows more deals at the top - lots of prospects, fewer engaged, fewer still closed. Here the Won category is the largest single group which suggests either a very efficient sales process or that the pipeline data skews toawrd completed deals rather than capturing every early stage opportunity. I would want to ask the sales ops team whether Prospecting and Engaging records are consistently logged or whether agents sometimes only enter deals once they are further along.
+
+```{r pipeline-trend}
+crm %>% 
+  filter(!is.na(close_date)) %>% 
+  mutate(close_month = floor_date(close_date, "month")) %>% 
+  group_by(close_month, deal_stage) %>% 
+  summarize(deals = n(), .groups = 'drop') %>% 
+  filter(deal_stage %in% c("Won", "Lost")) %>% 
+  ggplot(aes(x = close_month, y = deals, color = deal_stage)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = palette_stage) +
+  scale_x_date(date_labels = "%b '%y", date_breaks = "2 months") +
+  labs(
+    title = "Won vs. Lost Deals by Month",
+    subtitle = "Monthly closed deal volume across the full period",
+    x = NULL,
+    y = "Deals Closed",
+    color = NULL,
+    caption = "Prospecting and Engaging exlcuded - no close date recorded"
+  ) +
+  theme_crm()
+```
+The monthly trend tells me whether the business is accelerating or slowing down and whether won and lost deals move together or diverge. If won deals are climbing while lost deals hold flat that is a sign of improving sales effectiveness. If both are rising together it just means the team is working more deals. If lost deals are outpacing won deals in recent months that is the early warning sign of a pipeline problem worth investigating before it shows up in revenue.
+
+# Win Rate Analysis
+
+Win rate is the single most important metric in a sales pipeline. It tells you what percentage of closed deals you actually won. But an overall win rate number is almost meaningless on its own - it hides the enormous variation across products, sectors, regions, and individual agents. This section breaks that number apart to find where the business is winning consistently and where it is struggling.
+
+```{r win-rate-overall}
+win_rate_overall <- crm %>% 
+  filter(deal_stage %in% c("Won", "Lost")) %>% 
+  summarize(
+    total_closed = n(),
+    total_won = sum(deal_stage == "Won"),
+    win_rate = total_won / total_closed
+  )
+
+win_rate_overall
+```
+That is the headline number. But now I want to break it apart. A 63% overall win rate sounds healthy but it could be masking a product line that closes at 40% dragging down one that close at 80%.
+
+```{r win-rate-product}
+win_rate_product <- crm %>% 
+  filter(deal_stage %in% c("Won", "Lost")) %>% 
+  group_by(product, series) %>% 
+  summarize(
+    closed   = n(),
+    won      = sum(deal_stage == "Won"),
+    win_rate = won / closed,
+    avg_value = mean(close_value, na.rm = T),
+    .groups = 'drop'
+  ) %>% 
+  arrange(desc(win_rate))
+
+win_rate_product %>% 
+  mutate(
+    win_rate = percent(win_rate, accuracy = 0.1),
+    avg_value = dollar(avg_value, accuracy = 1)
+  ) %>% 
+  kable(
+    col.names = c("Product", "Series", "Closed Deals",
+                  "Won", "Win Rate", "Avg Deal Value"),
+    align = c("l", "l", "r", "r", "r", "r")
+  ) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+The win rates across products are surprisingly consistent — ranging from 60%
+to 64.8% across six of the seven products. That narrow band suggests the
+sales team is equally comfortable selling across the product line rather than
+relying on easy wins from one product. Two things stand out. GTK 500 is the
+highest value product at over $26,000 average deal size but has only 25
+closed deals in 15 months — that is worth investigating. Is it hard to sell,
+rarely pursued, or just a small market? And GTXPro is showing NA in the
+series column which means the product name in the pipeline does not exactly
+match the reference table — likely a spacing issue between GTXPro and GTX
+Pro. That is a data quality flag for whoever maintains the CRM.
+```{r win-rate-product-chart}
+win_rate_product %>% 
+  ggplot(aes(x = reorder(product, win_rate),
+             y = win_rate,
+             fill = series)) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = percent(win_rate, accuracy = 0.1)),
+            hjust = -0.1, size = 3.5, fontface = "bold") +
+  coord_flip(ylim = c(0.55, 0.7)) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = palette_series) +
+  labs(
+    title = "Win Rate by Product",
+    subtitle = "Win rates remarkably consistent across all products — 60% to 65% range",    
+    x = NULL,
+    y = "Win Rate %",
+    fill = "Series",
+    caption = "Closed deals only - Prospecting and Engaging excluded"
+  ) +
+  theme_crm()
+
+
+```
+The chart makes the variation immediately visible even though the spread is narrow. Win rates cluster tightly between 60% and 65% across all seven products which tells you this sales team is consistently disciplined regardless of what they are selling. MG Special leads at 64.8% and GTK 500 trails at 60% — a difference of less than 5 percentage points across the entire product line. The more actionable observation is GTXPro rendering in grey rather than a product series color, which confirms the naming mismatch we flagged in the table. That is a CRM hygiene issue that will cause reporting problems if left uncorrected.
+
+```{r}
+
+win_rate_sector <- crm %>%
+  filter(deal_stage %in% c("Won", "Lost")) %>%
+  group_by(sector) %>%
+  summarise(
+    closed   = n(),
+    won      = sum(deal_stage == "Won"),
+    win_rate = won / closed,
+    .groups  = "drop"
+  ) %>%
+  mutate(sector = str_to_title(sector)) %>%
+  arrange(desc(win_rate))
+
+win_rate_sector %>% 
+  ggplot(aes(x = reorder(sector, win_rate),
+             y = win_rate,
+             fill = win_rate > mean(win_rate_sector$win_rate))) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = percent(win_rate, accuracy = 0.1)),
+            hjust = -0.1, size = 3.5, fontface = "bold") +
+  geom_hline(yintercept = mean(win_rate_sector$win_rate),
+             linetype = "dashed", color = "grey50") +
+  coord_flip(ylim = c(0.58, 0.68)) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_fill_manual(values = c("TRUE" = "#27AE60", "FALSE" = "#E74C3C"),
+                    guide = "none") +
+  labs(
+    title = "Win Rate by Customer Sector",
+    subtitle = "Green = above average | Red = below average",
+    x = NULL,
+    y = "Win Rate %",
+    caption = "dashed line = overall average win rate",
+    fill = NULL
+  ) +
+  theme_crm()
+```
+The sector chart tells a similar story to the product chart — win rates are
+remarkably consistent across all ten sectors, ranging from 61.2% in finance
+to 64.8% in marketing. The top five sectors are all within a percentage point
+of each other. Finance sitting at the bottom is worth a conversation with the
+sales team — is that a competitive market, a pricing mismatch, or just a
+sector where we have historically underinvested in relationships? The more
+actionable question is not win rate but deal volume by sector, which we will
+cross reference in the performance section.
+
+```{r win-rate-region}
+win_rate_region <- crm %>% 
+  filter(deal_stage %in% c("Won", "Lost")) %>% 
+  group_by(regional_office) %>% 
+  summarize(
+    closed = n(),
+    won = sum(deal_stage == "Won"),
+    win_rate = won / closed,
+    total_revenue = sum(close_value, na.rm = T),
+    .groups = 'drop'
+  ) %>% 
+  arrange(desc(win_rate))
+
+win_rate_region %>% 
+  mutate(
+    win_rate = percent(win_rate, accuracy = 0.1),
+    total_revenue = dollar(total_revenue)
+  ) %>% 
+  kable(
+    col.names = c("Region", "Closed Deals", "Won", "Win Rate", "Total Revenue"),
+    align = c("l", "r", "r", "r", "r")
+  ) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+Three regions, three nearly identical win rates. West leads at 63.9% and
+Central trails at 62.6% — a gap so small it is essentially noise. What is
+more interesting is the revenue distribution. Central has the most closed
+deals at 2,604 but generates less total revenue than West which has 355
+fewer deals. That tells me West is working larger deals on average while
+Central is winning more frequently but at lower deal values. East sits in
+the middle on both dimensions. If I were advising the sales leadership team
+I would ask whether Central is deliberately targeting smaller accounts or
+whether there is an opportunity to move upmarket in that territory without
+sacrificing the win rate they have built.
+
+# Sales Performance
+
+Win rates by product and sector tell me about the business. Win rates by individual tell me about the people. This section looks at performance at the agent and manager level - who is winning the most, who is generating the most revenue, and whether tere are meaningful differences across the regional offices. This is usually the most politically sensitive section of any sales analysis so I want to be careful to show the data clearly without editorializing beyond what the numbers actually support.
+
+```{r agent-performance}
+agent_performance <- crm %>% 
+  filter(deal_stage %in% c("Won", "Lost")) %>% 
+  group_by(sales_agent, manager, regional_office) %>% 
+  summarize(
+    closed         = n(),
+    won            = sum(deal_stage == "Won"),
+    win_rate       = won / closed,
+    total_revenue  = sum(close_value, na.rm = T),
+    avg_deal       = mean(close_value, na.rm = T),
+    .groups        = 'drop'
+  ) %>% 
+  arrange(desc(total_revenue))
+
+agent_performance
+```
+30 agents, one row each. Before I chart anything I want to see the full
+table in the console to understand the range. The spread between the top
+and bottom revenue generators will tell me whether this is a team of
+consistent performers or one where a handful of agents are carrying
+everyone else.
+
+```{r agent-revenue-chart}
+
+agent_performance %>% 
+  ggplot(aes(x = reorder(sales_agent, total_revenue),
+             y = total_revenue,
+             fill = regional_office)) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = dollar(total_revenue, scale = 1e-3,
+                               suffix = "K", accuracy = 1)),
+            hjust = -0.1, size = 2.8, fontface = "bold") +
+  coord_flip(xlim = NULL,
+             ylim = c(0, max(agent_performance$total_revenue) * 1.25)) +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+  scale_fill_manual(values = c("Central" = "#2E86AB",
+                               "East"    = "#A23B72",
+                               "West"    = "#F18F01")) +
+  labs(
+    title    = "Total Revenue by Sales Agent",
+    subtitle = "Colored by regional office | Sorted by revenue",
+    x        = NULL,
+    y        = "Total Revenue",
+    fill     = "Region",
+    caption  = "Won deals only"
+  ) +
+  theme_crm()
+
+```
+Darcel Schlecht is the standout — $1,1M in total revenue, more than double
+the next closest agent at $478K. That is not a gradual slope from top to
+bottom, that is a cliff. One Central region agent is generating roughly 11%
+of all team revenue on their own. That kind of concentration is both
+impressive and a business risk — if Darcel leaves or has a bad quarter the
+team revenue takes a significant hit.
+
+Below Darcel the distribution is actually fairly healthy. A cluster of West
+and East agents sit between $400K and $480K and the drop off from there is
+gradual rather than sudden. The bottom five agents — Versie Hillebrand,
+Niesha Huffines, Wilburn Farren, and Violet Mclelland — are all generating
+under $200K which is worth a conversation about whether they are newer to
+the team, working a different type of deal, or genuinely underperforming.
+
+The regional mix across the top performers is balanced — Central, East, and
+West all have representation in the upper half of the chart which suggests
+the performance gap is individual rather than structural.
+```{r agent-winrate-chart}
+agent_performance %>%
+  ggplot(aes(x = reorder(sales_agent, win_rate),
+             y = win_rate,
+             fill = regional_office)) +
+  geom_col(alpha = 0.85) +
+  geom_vline(xintercept = mean(agent_performance$win_rate),
+             linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = mean(agent_performance$win_rate),
+             linetype = "dashed", color = "grey50") +
+  coord_flip(ylim = c(
+    min(agent_performance$win_rate) * 0.95,
+    max(agent_performance$win_rate) * 1.05
+  )) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("Central" = "#2E86AB",
+                               "East"    = "#A23B72",
+                               "West"    = "#F18F01")) +
+  labs(
+    title    = "Win Rate by Sales Agent",
+    subtitle = "Colored by regional office | Sorted by win rate",
+    x        = NULL,
+    y        = "Win Rate %",
+    fill     = "Region",
+    caption  = "Closed deals only"
+  ) +
+  theme_crm()
+
+```
+Unlike the product and sector charts where win rates were compressed into a
+4 point range, agent level win rates show real variation — from Hayden Neloms
+at 71% down to Lajuana Vencill at around 54%. That is a 17 percentage point
+spread which is significant and actionable.
+
+Hayden Neloms, Maureen Marcano, and Wilburn Farren lead the pack above 70%.
+Cross referencing with the revenue chart tells an interesting story — Wilburn
+Farren has one of the highest win rates on the team but is in the bottom five
+for revenue. That is a classic case of an agent who wins consistently but is
+not working enough deals or large enough deals to translate that efficiency
+into top line results.
+
+Darcel Schlecht — the top revenue generator by a wide margin — sits right
+around the team average for win rate at roughly 63%. That tells you the
+revenue dominance is coming from deal volume and deal size rather than
+superior closing ability.
+
+Lajuana Vencill, Markita Hansen, and Donn Cantrell sitting at the bottom of
+the win rate chart are the agents I would flag for coaching. Whether that is
+a skills gap, a territory problem, or a product fit issue is a conversation
+for the manager.
+
+```{r agent-scatter}
+
+agent_performance %>%
+  ggplot(aes(x = win_rate, y = total_revenue,
+             color = regional_office, label = sales_agent)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_text(vjust = -0.8, size = 2.8, fontface = "bold") +
+  geom_vline(xintercept = mean(agent_performance$win_rate),
+             linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = mean(agent_performance$total_revenue),
+             linetype = "dashed", color = "grey50") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = dollar_format(scale = 1e-3, suffix = "K")) +
+  scale_color_manual(values = c("Central" = "#2E86AB",
+                                "East"    = "#A23B72",
+                                "West"    = "#F18F01")) +
+  labs(
+    title    = "Agent Performance — Win Rate vs. Revenue",
+    subtitle = "Top right = high win rate and high revenue | Reference lines = team averages",
+    x        = "Win Rate %",
+    y        = "Total Revenue",
+    color    = "Region",
+    caption  = "Each point is one sales agent"
+  ) +
+  theme_crm()
+
+```
+The scatter plot makes the full picture immediately readable. Four quadrants,
+four different conversations.
+
+Darcel Schlecht is an outlier in the most literal sense — sitting so far
+above the revenue average that the chart almost needs a different scale to
+show everyone else clearly. Above average win rate and nearly double the
+revenue of the next closest agent. That is an exceptional performer worth
+understanding — what are they doing differently in terms of deal selection,
+account targeting, or closing approach?
+
+The top right quadrant — above average on both dimensions — is where you
+want your team to live. Reed Clapper, James Ascencio, and Corliss Cosme all
+sit there comfortably. These are your consistent performers.
+
+The most interesting quadrant is the bottom right — high win rate but below
+average revenue. Hayden Neloms, Maureen Marcano, and Wilburn Farren all sit
+here. These agents are closing at 68% to 71% which is elite efficiency but
+are not translating it into revenue. The question for their manager is
+whether they are being pointed at deals that are too small or whether they
+need to be pushed to work a higher volume.
+
+The bottom left — Lajuana Vencill, Markita Hansen, Donn Cantrell — are the
+agents that need the most attention. Low win rate and below average revenue
+is the combination that indicates a fundamental performance gap rather than
+just a deal mix problem.
+
+# Deal Velocity
+
+Win rate and revenue tell me what happened. Deal velocity tells me how long
+it took. The number of days between first engagement and close is one of the
+most underanalyzed metrics in sales operations. A long sales cycle ties up
+agent time, delays revenue recognition, and often signals deals that are
+stuck or unlikely to close. A short sales cycle can mean efficient selling
+or it can mean agents are rushing deals that needed more nurturing. Either
+way the distribution is worth understanding.
+
+```{r velocity-summary}
+velocity_summary <- crm %>%
+  filter(deal_stage %in% c("Won", "Lost"),
+         !is.na(days_to_close),
+         days_to_close >= 0) %>%
+  group_by(deal_stage) %>%
+  summarise(
+    deals      = n(),
+    avg_days   = mean(days_to_close),
+    median_days = median(days_to_close),
+    min_days   = min(days_to_close),
+    max_days   = max(days_to_close),
+    .groups    = "drop"
+  )
+
+velocity_summary %>%
+  mutate(across(where(is.numeric), round, 1)) %>%
+  kable(
+    col.names = c("Stage", "Deals", "Avg Days",
+                  "Median Days", "Min Days", "Max Days"),
+    align     = c("l", "r", "r", "r", "r", "r")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+The table reveals something counterintuitive at first glance. Lost deals
+have a lower average cycle length at 41.5 days compared to 51.8 days for
+won deals. But the median tells the more honest story — won deals have a
+median of 57 days while lost deals have a median of just 14 days. That gap
+is significant. It tells me that most lost deals die very quickly, likely
+in the early stages of engagement before any serious selling happens. The
+deals that make it past the initial conversation and into a real evaluation
+tend to close as wins. That is actually an encouraging signal about the
+quality of the sales process — once a prospect is genuinely engaged the
+team converts at a high rate. The challenge is in the early qualification
+stage where deals are being lost fast.
+
+```{r velocity-distribution}
+crm %>%
+  filter(deal_stage %in% c("Won", "Lost"),
+         !is.na(days_to_close),
+         days_to_close >= 0) %>%
+  ggplot(aes(x = days_to_close, fill = deal_stage)) +
+  geom_histogram(binwidth = 10, alpha = 0.7, position = "identity") +
+  facet_wrap(~deal_stage, ncol = 1) +
+  scale_fill_manual(values = palette_stage, guide = "none") +
+  scale_x_continuous(breaks = seq(0, 400, 50)) +
+  labs(
+    title    = "Deal Cycle Length Distribution — Won vs. Lost",
+    subtitle = "How many days from first engagement to close",
+    x        = "Days to Close",
+    y        = "Number of Deals",
+    caption  = "Binwidth = 10 days"
+  ) +
+  theme_crm()
+```
+The distribution shapes confirm what the median told us. Lost deals show a
+massive spike in the first 10 days — the bulk of losses happen almost
+immediately after engagement. Won deals have an early spike of quick closes
+but then spread across a much wider range with a second concentration around
+80 to 110 days.
+
+Before drawing conclusions I want to flag a data quality concern. That lost
+deal spike in the first 10 days could mean two very different things. It
+could reflect genuinely fast losses — prospects who disengage immediately
+after the first conversation. Or it could reflect a CRM logging problem
+where agents are only entering lost deals retroactively after the fact,
+recording the engage date and close date close together because they are
+entering both at the same time. The second interpretation is actually more
+common in real sales environments where CRM hygiene is inconsistent.
+
+If the data is trustworthy the insight is that early qualification is where
+deals are being lost and the team should invest in better discovery processes.
+If the data has a logging problem the insight is that CRM adoption needs
+enforcement before velocity metrics can be trusted. Either way it is a
+conversation worth having with sales operations before acting on this data.
+
+```{r velocity-product}
+crm %>%
+  filter(deal_stage == "Won",
+         !is.na(days_to_close),
+         days_to_close >= 0) %>%
+  group_by(product) %>%
+  summarise(
+    avg_days    = mean(days_to_close),
+    median_days = median(days_to_close),
+    deals       = n(),
+    .groups     = "drop"
+  ) %>%
+  ggplot(aes(x = reorder(product, avg_days),
+             y = avg_days,
+             fill = avg_days)) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = paste0(round(avg_days, 0), " days")),
+            hjust = -0.1, size = 3.5, fontface = "bold") +
+  coord_flip(ylim = c(0, max(crm$days_to_close, na.rm = TRUE) * 0.6)) +
+  scale_fill_gradient(low = "#27AE60", high = "#E74C3C", guide = "none") +
+  labs(
+    title    = "Average Days to Close by Product",
+    subtitle = "Won deals only | Green = faster | Red = slower",
+    x        = NULL,
+    y        = "Average Days to Close",
+    caption  = "Won deals only"
+  ) +
+  theme_crm()
+```
+The product velocity chart is surprisingly flat — five of the seven products
+close within a 4 day range of each other, between 51 and 55 days. That level
+of consistency across products with wildly different price points is unusual.
+MG Special at $55 average deal value closes in 51 days and MG Advanced at
+$3,389 closes in 52 days. You would expect a higher value product to take
+longer given the additional scrutiny involved in larger purchases.
+
+GTK 500 is the clear outlier at 64 days which makes sense — at $26,707
+average deal size it is the most complex sale in the portfolio and likely
+involves multiple stakeholders and procurement review. The fact that it only
+takes 10 days longer than a $55 product is actually impressive if the data
+is accurate.
+
+GTXPro closing fastest at 48 days is interesting given it has an unresolved
+naming issue in the data. That result should be treated with some caution
+until the product matching problem is resolved.
+
+Overall the velocity data suggests a sales team operating with a fairly
+standardized process regardless of product complexity. Whether that is a
+strength or a sign that the team is not tailoring their approach to deal
+size is worth exploring with the sales managers.
+
+# Executive Summary
+
+I have now looked at this sales pipeline through five lenses — overall
+pipeline shape, win rates across products and sectors, individual agent
+and manager performance, and deal velocity. Here is what I would walk
+into the sales leadership meeting to say. These are patterns not
+conclusions. Every finding here is a question that deserves a
+conversation before anyone acts on it.
+
+```{r exec-summary-table}
+tibble(
+  Category = c(
+    "Total Deals in Pipeline",
+    "Overall Win Rate",
+    "Total Revenue (Won Deals)",
+    "Average Deal Value",
+    "Top Revenue Agent",
+    "Highest Win Rate Agent",
+    "Fastest Closing Product",
+    "Slowest Closing Product",
+    "Best Sector Win Rate",
+    "Worst Sector Win Rate"
+  ),
+  Value = c(
+    comma(nrow(crm)),
+    percent(sum(crm$deal_stage == "Won") /
+            sum(crm$deal_stage %in% c("Won", "Lost")), 0.1),
+    dollar(sum(crm$close_value, na.rm = TRUE)),
+    dollar(mean(crm$close_value, na.rm = TRUE), accuracy = 1),
+    agent_performance %>% slice_max(total_revenue, n = 1) %>% pull(sales_agent),
+    agent_performance %>% slice_max(win_rate, n = 1) %>% pull(sales_agent),
+    crm %>% filter(deal_stage == "Won", !is.na(days_to_close)) %>%
+      group_by(product) %>%
+      summarise(avg = mean(days_to_close)) %>%
+      slice_min(avg, n = 1) %>% pull(product),
+    crm %>% filter(deal_stage == "Won", !is.na(days_to_close)) %>%
+      group_by(product) %>%
+      summarise(avg = mean(days_to_close)) %>%
+      slice_max(avg, n = 1) %>% pull(product),
+    win_rate_sector %>% slice_max(win_rate, n = 1) %>% pull(sector),
+    win_rate_sector %>% slice_min(win_rate, n = 1) %>% pull(sector)
+  ),
+  Signal = c(
+    "8,800 opportunities tracked",
+    "Healthy but masking variation",
+    "Won deals only — losses unvalued",
+    "Wide range by product",
+    "Significant concentration risk",
+    "High win rate low revenue",
+    "Consistent across most products",
+    "Expected given deal complexity",
+    "Marginal difference from worst",
+    "Worth a conversation"
+  )
+) %>%
+  kable(align = c("l", "r", "l")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE)
+```
+
+**What looks healthy:**
+
+The overall win rate of 63% is strong and remarkably consistent across
+products, sectors, and regions. There is no single product that is
+dramatically underperforming and no sector where the team cannot compete.
+The deal velocity data shows a standardized sales process that works
+across a wide range of deal sizes. And the distribution of revenue across
+regions is balanced — this is not a one region business.
+
+**What I am watching:**
+
+The bimodal distribution of won deal cycle lengths suggests two distinct
+sales motions — transactional and complex — that may need different
+management approaches. The GTK 500 is the highest value product in the
+portfolio but generated only 25 closed deals in 15 months. Whether that
+reflects market size, lack of pursuit, or genuine difficulty selling at
+that price point is worth understanding.
+
+**What I am flagging for immediate conversations:**
+
+Darcel Schlecht generating 11% of total team revenue alone is the single
+biggest risk in this dataset. That level of concentration in one individual
+is a business continuity problem. If that agent leaves, takes a bad quarter,
+or moves to a competitor the revenue impact is immediate and significant.
+The team needs a plan to develop the next tier of high performers.
+
+The early deal loss spike — the majority of lost deals closing within 10
+days — needs investigation before anyone draws conclusions from it. It
+could be a qualification problem or it could be a CRM logging problem.
+Those are completely different root causes that require completely different
+responses. Sales operations needs to audit a sample of those early losses
+to determine which it is.
+
+Close value is not being recorded for lost deals. That means we cannot
+calculate the true cost of losses, cannot prioritize which losses hurt
+most, and cannot build a complete picture of pipeline value. Getting agents
+to log estimated deal value at the time of engagement — not just at close
+— would significantly improve the quality of future analysis.
