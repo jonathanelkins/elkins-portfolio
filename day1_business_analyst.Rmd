@@ -137,9 +137,53 @@ monthly_pl <- tibble(
     month_label = format(month, "%b %Y")
   )
 
+monthly_pl %>% 
+  select(
+    month_label,
+    revenue, cogs, gross_profit, gross_margin,
+    opex_salaries, opex_marketing, opex_tech, opex_facilities, opex_other,
+    total_opex, ebitda, ebitda_margin
+  ) %>% 
+  pivot_longer(-month_label, names_to = "line_item", values_to = "value") %>% 
+  mutate(
+    line_item = recode(
+      line_item,
+      revenue = "Revenue",
+      cogs = "COGS",
+      gross_profit = "Gross Profit",
+      gross_margin = "Gross Margin",
+      opex_salaries = "Opex - Salaries",
+      opex_marketing = "Opex - Marketing",
+      opex_tech = "Opex - Tech",
+      opex_facilities = "Opex - Facilities",
+      opex_other = "Opex - Other",
+      total_opex = "Total Opex",
+      ebitda = "EBITDA",
+      ebitda_margin = "EBITDA Margin"
+    ),
+    line_item = factor(line_item, levels = unique(line_item)),
+    value = if_else(
+      str_detect(line_item, "Margin"),
+      scales::percent(value, accuracy = 0.01),
+      scales::dollar(value, accuracy = 1)
+    )
+  ) %>% 
+  pivot_wider(names_from = month_label, values_from = value) %>% 
+  arrange(line_item) %>% 
+  kable(
+    col.names = c("Line Item", names(.)[-1]),
+    align = c("l", rep("r", ncol(.) - 1))
+  ) %>% 
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    font_size = 12
+  ) %>% 
+  kableExtra::scroll_box(width = "100%")
+
 ```
 
-This is the core P&L table. Each row is one month. Revenue and COGS are the
+This is the core P&L table. Each column is one month. Revenue and COGS are the
 top two lines — the difference between them is gross profit. Below that are
 five operating expense categories that together make up total OpEx. The derived
 columns at the end — gross profit, gross margin, EBITDA, EBITDA margin — are
@@ -172,6 +216,23 @@ budget_vs_actual <- tibble(
     actual = budget * (1 + variance_pct),
     variance = actual - budget
   )
+
+budget_vs_actual %>% 
+  mutate(
+    budget = dollar(budget),
+    variance_pct = percent(variance_pct, accuracy = .01),
+    actual = dollar(actual, accuracy = .01),
+    variance = dollar(variance, accuracy = .01)
+  ) %>% 
+  kable(
+    col.names = c("Month", "Department", "Budget", "Variance %", "Actual", "Variance")
+  ) %>% 
+    kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>% 
+    kableExtra::scroll_box(width = "100%")
+
 ```
 
 This table covers 2024 only because budget vs. actual is always a current year
@@ -193,6 +254,22 @@ headcount <- tibble(
     total_labor_cost = headcount * avg_salary,
     fully_loaded = total_labor_cost * 1.25
   )
+
+headcount %>% 
+  mutate(
+    avg_salary = dollar(avg_salary),
+    attrition_rate = percent(attrition_rate, accuracy = 1),
+    total_labor_cost = dollar(total_labor_cost),
+    fully_loaded = dollar(fully_loaded)
+  ) %>% 
+  kable(
+    col.names = c("Department", "Headcount", "Avg Salary", "Avg Tenure Yrs", "Open Reqs", "Attrition %", "Total Labor Cost", "Fully Loaded Cost")
+  ) %>% 
+    kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>% 
+    kableExtra::scroll_box(width = "100%")
 
 ```
 
@@ -221,6 +298,25 @@ unit_econ <- tibble(
     ltv_cac_ratio     = ltv / cac,
     cogs_per_customer = monthly_pl$cogs / total_customers
   )
+
+unit_econ %>% 
+  mutate(
+    month = format(month, "%b %Y"),
+    sales_marketing_spend = dollar(sales_marketing_spend),
+    cac = dollar(cac, accuracy = 0.01),
+    arpu = dollar(arpu, accuracy = 0.01),
+    churn_rate = percent(churn_rate, accuracy = 0.01),
+    ltv = dollar(ltv, accuracy = 0.01),
+    cogs_per_customer = dollar(cogs_per_customer, accuracy = 0.01)
+  ) %>% 
+  kable(
+    col.names = c("Month", "New Customers", "Churned Customers", "Marketing Spend", "Total Customers", "Customer Acquisition Cost", "Avg Revenue per User", "Churn Rate", "Lifetime Value", "LTV:CAC Ratio", "COGS/Customer")
+  )%>% 
+    kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>% 
+    kableExtra::scroll_box(width = "100%")
 
 ```
 
@@ -383,13 +479,13 @@ monthly_pl %>%
 ```
 
 This is the most important chart in the section. The business was losing money
-at the operating level in its earliest months — EBITDA was negative in January
+at the operating level in its earliest months as EBITDA was negative in January
 and February of 2023. That is not unusual for a company investing heavily in
 headcount and infrastructure ahead of revenue growth. What matters is the
 direction. By mid 2023 the business had turned the corner and has been mostly
 EBITDA positive since, with a few exceptions that coincide with the revenue dips
-we saw in the first chart. The margins are thin — most positive months are in
-the 2 to 7 percent range — which means there is not a lot of cushion if revenue
+we saw in the first chart. The margins are thin as most positive months are in
+the 2 to 7 percent range, which means there is not a lot of cushion if revenue
 misses or costs spike unexpectedly. That is the watch item coming out of this
 section.
 
@@ -515,12 +611,12 @@ budget_vs_actual %>%
 ```
 
 Marketing is consistently over budget every single month with no meaningful
-improvement. That is not a one-time event — it is a structural overspend that
+improvement. That is not a one-time event. It is a structural overspend that
 someone either approved and did not communicate or has not noticed yet. Sales
 is volatile, swinging above and below budget month to month, which is consistent
 with a variable commission structure tied to deal timing. Customer Success has
 been running under all year but is trending toward breakeven by December. Cross
-referenced with their attrition rate that trend is worth watching — if they
+referenced with their attrition rate that trend is worth watching beacuse if and when they
 start backfilling roles aggressively that underspend will flip quickly.
 
 # Headcount & Labor Cost Analysis
@@ -559,14 +655,14 @@ headcount_display %>%
 
 A few things jump out immediately. Engineering is by far the largest cost center
 at $4.4 million fully loaded annually and has the most open roles at 5. G&A has
-the highest average tenure at 4.2 years which makes sense — finance, legal, and
+the highest average tenure at 4.2 years which makes sense as finance, legal, and
 HR tend to be stable functions. Customer Success has the lowest average salary
 at $68,000 and the highest attrition at 25%. That combination is worth pausing
 on. The people responsible for keeping customers happy are the least compensated
 and the most likely to leave. The two charts below break this down further.
 
 The first view compares fully loaded labor cost across departments. The second
-looks at attrition rate with a threshold line at 18% — departments above that
+looks at attrition rate with a threshold line at 18%, departments above that
 line are losing people at a rate that creates real operational risk.
 
 ```{r headcount-charts}
@@ -617,11 +713,11 @@ p_hc1 + p_hc2
 Engineering dominates the cost chart which is expected given the combination of
 headcount and salary. What stands out on the attrition chart is that three of
 five departments are at or above the 18% threshold. That is not a one department
-problem — it is a company wide retention issue that finance leadership needs to
+problem, it is a company wide retention issue that finance leadership needs to
 be aware of.
 
 The bar charts show each dimension separately. This next view combines them.
-The goal is to find departments where high cost and high attrition overlap —
+The goal is to find departments where high cost and high attrition overlap,
 because that is where the business is taking the most financial risk. Every
 person who leaves has to be replaced, and replacement costs typically run 50
 to 100 percent of annual salary when you account for recruiting, onboarding,
@@ -657,15 +753,15 @@ headcount %>%
   
 ```
 
-Engineering sits in the top left — expensive but well retained. That is the
-ideal position. G&A sits in the bottom left — lower cost and stable. Customer
-Success sits in the bottom right — lower salary but the highest attrition in
+Engineering sits in the top left, expensive but well retained. That is the
+ideal position. G&A sits in the bottom left, lower cost and stable. Customer
+Success sits in the bottom right where it has a lower salary but the highest attrition in
 the company. That is the danger quadrant. You are not paying a lot per person
 but you are cycling through people constantly in a role where relationship
 continuity directly affects whether customers stay or leave. Marketing is also
 above the attrition threshold and above average salary which makes it the
 second most concerning department from a retention standpoint. Sales sits right
-on the threshold — worth watching but not yet a red flag on its own.
+on the threshold, which is worth watching but not yet a red flag on its own.
 
 # Unit Economics
 
